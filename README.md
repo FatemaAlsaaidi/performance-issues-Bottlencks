@@ -113,22 +113,46 @@
 
     - Why it’s bad: Databases are fast at set operations, slow at chatty loops.
 **Solve**
-    - Batch Writes
-      - How: Accumulate changes and write in bulk.
-      - Benefit: Fewer commands, reduced overhead.
-      - Example:
-        ```csharp
-        var orderProductsList = new List<OrderProducts>();
-        foreach (var item in items)
-        {
-            // ... existing logic ...
-            orderProductsList.Add(new OrderProducts { OID = order.OID, PID = existingProduct.PID, Quantity = item.Quantity });
-            // Update stock in-memory
-            existingProduct.Stock -= item.Quantity;
-        }
-        _orderProductsService.AddOrderProductsBulk(orderProductsList);
-        _productService.UpdateProductsBulk(productsToUpdate);
-        ```
+   - Idea: Use a RowVersion/xmin style column or a guarded UPDATE to prevent overselling within one transaction.
+
+   - Performance impact:
+         1. Avoids inconsistent states → fewer compensations/retries later.
+
+      2. Under contention, failed attempts are short and cheap.
+      Two common patterns:
+
+- RowVersion (EF Core)
+```csharp
+public class Product {
+    public int PID { get; set; }
+    public string Name { get; set; }
+    public int Stock { get; set; }
+    [Timestamp] public byte[] RowVersion { get; set; }
+}
+```
+
+
+- When saving, if another tx changed the row, EF throws DbUpdateConcurrencyException. You can re-fetch and retry or return “out of stock.”
+
+- Guarded SQL Update
+
+    ``` csharp
+    UPDATE dbo.Product
+    SET Stock = Stock - @Qty
+    WHERE PID = @PID AND Stock >= @Qty;
+    SELECT @@ROWCOUNT AS Affected;
+    ```
+
+
+- If Affected = 0, stock was insufficient or changed—fail fast.
+
+- When to choose which:
+
+    1. EF everywhere → RowVersion is smoother.
+
+    2. Mixed tech / heavy hot-path → guarded SQL is leaner and very fast.
+
+        
 2) Missing Explicit Transaction Boundaries
 
     - What happens: If AddOrder, UpdateOrder, and per-item updates each run in their own implicit transaction, you risk partial commits.
@@ -171,18 +195,48 @@
     - Why it’s bad: Validation uses stale reads; update isn’t guarded by a concurrency check.
 
 **Solve**
-    - Use Concurrency Controls
-      - How: Implement optimistic concurrency (e.g., row versioning) or pessimistic locks during stock checks and updates.
-      - Benefit: Prevents overselling, ensures data integrity.
-      - Example:
+
+    - Idea: Use a RowVersion/xmin style column or a guarded UPDATE to prevent overselling within one transaction.
+
+    - Performance impact:
+
+    1. Avoids inconsistent states → fewer compensations/retries later.
+
+    2 .Under contention, failed attempts are short and cheap.
+
+    - Two common patterns:
+
         ```csharp
-        // Optimistic concurrency example
-        var product = _dbContext.Products.Single(p => p.PID == existingProduct.PID);
-        if (product.Stock < item.Quantity)
-            throw new Exception("Insufficient stock");
-        product.Stock -= item.Quantity;
-        _dbContext.SaveChanges();
+        RowVersion (EF Core)
+
+        public class Product {
+            public int PID { get; set; }
+            public string Name { get; set; }
+            public int Stock { get; set; }
+            [Timestamp] public byte[] RowVersion { get; set; }
+        }
         ```
+
+
+    - When saving, if another tx changed the row, EF throws DbUpdateConcurrencyException. You can re-fetch and retry or return “out of stock.”
+
+    Guarded SQL Update
+
+    ```csharp
+    UPDATE dbo.Product
+    SET Stock = Stock - @Qty
+    WHERE PID = @PID AND Stock >= @Qty;
+    SELECT @@ROWCOUNT AS Affected;
+    ```
+
+
+- If Affected = 0, stock was insufficient or changed—fail fast.
+
+- When to choose which:
+
+- EF everywhere → RowVersion is smoother.
+
+- Mixed tech / heavy hot-path → guarded SQL is leaner and very fast.
 
 4) Lookup by Product Name
 
@@ -218,16 +272,87 @@
     - Why it’s bad: ASP.NET Core scales better with async IO.
 
 **Solve**
-    - Make Async
-      - How: Use async/await and return Task.
-      - Benefit: Frees up threads during IO waits.
-      - Example:
-        ```csharp
-        public async Task PlaceOrderAsync(List<OrderItemDTO> items, int uid)
-        {
-            // Async logic here
-        }
-        ```
+   - Use async for all DB calls to free threads during IO.
+   - Performance impact:
+   
+        a. Higher throughput at the same CPU.
+
+        b. Lower thread-pool starvation under load.
+
+      ```csharp
+        
+        public async Task<int> PlaceOrderAsync(List<OrderItemDTO> items, int uid)
+{
+    var names = items.Select(i => i.ProductName).Distinct().ToList();
+    var products = await _productService.GetByNamesAsync(names);
+    var byName = products.ToDictionary(p => p.Name, StringComparer.OrdinalIgnoreCase);
+
+    foreach (var item in items)
+    {
+        if (!byName.TryGetValue(item.ProductName, out var p))
+            throw new KeyNotFoundException($"{item.ProductName} not found");
+        if (p.Stock < item.Quantity)
+            throw new InvalidOperationException($"{item.ProductName} is out of stock");
+    }
+
+    await using var tx = await _db.BeginTransactionAsync();
+
+    var order = new Order { UID = uid, OrderDate = DateTime.UtcNow };
+    await AddOrderAsync(order);
+
+    decimal total = 0m;
+    var lines = new List<OrderProducts>(items.Count);
+
+    foreach (var item in items)
+    {
+        var p = byName[item.ProductName];
+        p.Stock -= item.Quantity;
+        total += item.Quantity * p.Price;
+        lines.Add(new OrderProducts { OID = order.OID, PID = p.PID, Quantity = item.Quantity });
+    }
+
+    await _orderProductsService.BulkAddAsync(lines);
+    await _productService.BulkUpdateAsync(products);
+    order.TotalAmount = total;
+    await UpdateOrderAsync(order);
+
+    await tx.CommitAsync();
+    return order.OID;
+}
+
+      ```
+
+6) Prefer Product IDs in API (Structural fix, long-term)
+
+Idea: Accept PID in OrderItemDTO and validate client-side names. Keep a fallback “resolve by name” path if necessary.
+
+Performance impact:
+
+Faster lookups (PK/unique index), fewer collation surprises, better cache reuse.
+
+Trade-off: Requires client change and migration plan.
+
+
+7) Indexing & Data Modeling
+
+Add/verify indexes:
+
+Product(Name) (if you must search by name).
+
+Foreign keys: OrderProducts(OID), OrderProducts(PID).
+
+Use decimal(18,2) for money (already decimal) and UTC (DateTime.UtcNow).
+
+Keep rows narrow to reduce IO.
+
+
+8) SaveChanges Once per Aggregate
+
+Idea: With EF Core, track changes to Order, OrderProducts, and Product then call one SaveChanges (or SaveChangesAsync) inside a transaction.
+
+Performance impact: Minimizes round trips and transaction log flushes.
+
+
 
 
 
